@@ -3,6 +3,9 @@
 Export anonymous, fully rendered TYPO3 pages—including normally uncached plugins—to StaticFileCache-compatible **plain HTML file paths**. Serve the snapshots directly through Apache without a public PHP frontend or backend.
 
 This is an external HTTP snapshot tool, not a TYPO3 extension. It does not change a plugin's cacheability, bootstrap TYPO3, or depend on TYPO3's PHP version. Version-specific CLI entry scripts share one implementation.
+This independent project targets the cache layouts of the [StaticFileCache TYPO3 extension](https://github.com/lochmueller/staticfilecache). See that upstream project for the extension itself; this tool is not an official part of it.
+
+Licensed under [GNU GPL version 3.0](LICENSE) (`GPL-3.0-only`).
 
 ## Requirements
 
