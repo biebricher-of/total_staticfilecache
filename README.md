@@ -7,33 +7,65 @@ This is an external HTTP snapshot tool, not a TYPO3 extension. It does not chang
 ## Requirements
 
 - **Exporter:** PHP 8.2+ CLI with cURL, DOM/libxml and zlib. Run on a separate modern machine if the legacy TYPO3 host cannot run this PHP version.
-- **Public server:** Apache 2.4.8+ with `mod_rewrite`, `mod_mime`, `mod_dir`, and `.htaccess` overrides for FileInfo, Options and Indexes. Apache 2.2 is not supported, even for TYPO3 4.7.
+- **Public server:** Apache 2.4.10+ with `mod_rewrite`, `mod_mime`, `mod_dir`, `mod_headers`, and `.htaccess` overrides for FileInfo, Options and Indexes. Apache 2.2 is not supported, even for TYPO3 4.7.
 - A functioning anonymous rendering endpoint for the source site, accessible during exports.
 - Human review of the rendered snapshots before publication.
 
 ## Export
 
-Use the entry script matching the installed StaticFileCache major. See [COMPATIBILITY.md](COMPATIBILITY.md) for the source-verified version matrix and historical `nc_staticfilecache` naming.
+Use the entry script matching the installed StaticFileCache major. **TYPO3 14 uses `staticfilecache-v16.php`** (16 is the extension major, not the TYPO3 major). See [COMPATIBILITY.md](COMPATIBILITY.md) for the source-verified version matrix and historical `nc_staticfilecache` naming.
+
+### 1. Export from sitemaps
+
+Supply one or more **absolute sitemap URLs**. No `--base-url` is needed for a root-mounted installation:
 
 ```sh
-php staticfilecache-v13.php \
-  --base-url=https://www.example.org \
+php staticfilecache-v16.php \
   --sitemap=https://www.example.org/sitemap.xml \
-  --urls=extra-urls.txt \
-  --output=/tmp/example-static-release
+  --sitemap=https://www.example.de/sitemap.xml \
+  --output=/tmp/instance-static-release
 ```
 
-`--sitemap` and `--urls` are alternatives; they may also be combined. A URL list contains one absolute or site-relative URL per line, with blank lines and `#` comments allowed. Sitemap indexes are expanded recursively. Include all languages and all pages you intend to publish: the tool does not follow HTML links.
+Repeat `--sitemap` for the domains/languages of **one TYPO3 instance sharing one public cache directory**. Sitemap indexes are expanded recursively. Include every sitemap you intend to publish: the tool does not follow HTML links.
+
+Without `--base-url`, the first sitemap defines the primary origin and the installation prefix defaults to `/`. The sitemap's directory is **not** inferred as an installation prefix. For a subdirectory installation, add `--base-url=https://www.example.org/site`, even when exporting only from sitemaps. With that explicit base, relative sitemap arguments are also accepted.
+
+### 2. Export from URL-list files
+
+Supply `--base-url` with `--urls`, even if every URL in the file is absolute. It defines the trusted primary origin, installation prefix and how relative page URLs are resolved:
+
+```sh
+php staticfilecache-v16.php \
+  --base-url=https://www.example.org \
+  --urls=pages.txt \
+  --output=/tmp/list-static-release
+```
+
+Example `pages.txt`:
+
+```text
+https://www.example.org/
+/contact/
+/products/
+```
+
+URL lists contain one absolute or site-relative URL per line; blank lines and `#` comments are allowed. Repeat `--urls` for additional files. You may combine `--urls` and `--sitemap` in one invocation; `--base-url` remains required whenever `--urls` is used. URL-list contents do not grant trust to additional domains: supply their sitemap URLs explicitly when exporting a multi-domain instance.
+
+### Shared output and trusted domains
+
+Explicitly supplied sitemap URLs and the optional base URL define the trusted origins (scheme, hostname and port). All use the same installation prefix. Child sitemaps, page URLs and redirects may cross between these origins, but XML content and redirects never grant trust to another origin. Every explicitly supplied sitemap must be safe and within that prefix, even if another sitemap already references it. One export produces one cache tree, one manifest and one `.htaccess` for all these domains. Identical paths on different domains remain separate snapshots; the rules match each page's own hostname and port. The manifest's `origin` is the explicit base origin or, without one, the first sitemap origin; `origins` lists all trusted origins, including domains with no successful pages.
 
 For TYPO3 installed below a URL prefix, include it in the base URL, e.g. `--base-url=https://www.example.org/site`. The output cache directory is relative to **that installation's public web directory**; exported page paths retain the URL prefix where the historical cache format does so.
 
-The output directory must be new or empty. Exporting directly into a live installation is deliberately refused. On failure, the command exits nonzero and does not generate the deployment rules; partial staging files are not a publishable release.
+The output directory must be new or empty. Exporting directly into a live installation is deliberately refused. **Individual page failures still produce `full-static.htaccess`**, mapping only successfully captured pages, and a manifest with `complete: false` and failure details. The command reports those failures and **exits 1**; a complete export exits 0. Review incomplete exports yourself before deciding whether to deploy: failed or missing pages return 404, never PHP fallback. If every capture fails, the generated rules serve no HTML pages.
+
+Fatal configuration, unsafe source URLs or redirects, cache collisions, and file/publication errors still stop the export without publishing new deployment rules. Individual files are published atomically without replacing existing files or symlinks. Partial output after a fatal error is not a publishable release. The exporter never deploys anything automatically.
 
 Output:
 
 ```text
 example-static-release/
-├── full-static.htaccess       # replacement public .htaccess; generated only after success
+├── full-static.htaccess       # replacement public .htaccess, including for incomplete exports
 ├── manifest.json             # export report; do not publish
 └── typo3temp/...              # version-specific cache directory and HTML files
 ```
@@ -43,8 +75,8 @@ The fresh cache directory includes a minimal `.htaccess` forcing saved responses
 
 ## Switch to static-only delivery
 
-1. Export while the source still renders through PHP. Inspect the manifest and sample pages, including plugin output and every language.
-2. Test on a staging hostname with equivalent hostname routing. Verify that all referenced assets still exist and are permitted by the generated asset rules.
+1. Export while the source still renders through PHP. Inspect the manifest's `complete` flag and failures, plus sample pages, plugin output, every language and every instance domain. Decide explicitly whether any missing pages are acceptable before publishing an incomplete export.
+2. Test on staging with equivalent hostname/port routing for **every** instance domain. Verify that all referenced assets still exist and are permitted by the generated asset rules.
 3. Back up the installation's existing `.htaccess` and cache directory outside the public web root.
 4. Publish the **complete fresh cache directory** from the output. Do not merge it into a live extension cache containing old `.htaccess` expiry rules.
 5. Replace the installation's public `.htaccess` with `full-static.htaccess`. **Do not append it below TYPO3's existing rewrite rules.** Use a controlled deployment/maintenance window or an atomic release switch; publishing the rules and files separately is not atomic.
@@ -55,6 +87,8 @@ For legacy installations, the public directory may be the project root. For Comp
 The generated rules permit GET/HEAD, reject other methods with 405, return 404 for unexported pages and direct script requests, disable directory listings and MultiViews, and use inline errors rather than PHP error documents. They permit existing public assets in `fileadmin/`, `uploads/`, `typo3temp/assets/`, `_assets/`, `typo3conf/ext/*/Resources/Public/`, and `typo3/sysext/*/Resources/Public/`, restricted to common static extensions, plus selected root files such as `robots.txt`. Review these allowlists for your installation; legacy extensions with unconventional asset paths may need explicit additions. Asset version query strings remain allowed.
 
 Legacy public paths are also covered: `typo3temp/compressor/`, `typo3temp/GB/`, `typo3temp/pics/`, `typo3temp/temp/`, generated `typo3temp/javascript_*.js` and `stylesheet_*.css`, extension `res/` directories, and the old CMS `tslib/media/` tree. The extension allowlist still applies. `AddDefaultCharset Off` leaves encoding declarations in the saved HTML authoritative; review pages that relied solely on an HTTP charset header.
+
+Cached HTML responses include `X-Total-StaticFileCache: HIT` (also for HEAD and conditional 304 responses). Assets and errors do not receive this header. It is set in the generated cache-directory `.htaccess`; deploy that file with the snapshots. No browser cache lifetime is set or changed.
 
 **Server configuration matters:** `.htaccess` cannot undo every virtual-host alias, parent rewrite, handler mapping or external `ErrorDocument`. For the strongest no-PHP boundary, use a dedicated static virtual host without PHP/FastCGI handlers, CGI, SSI, aliases to the backend, or inherited PHP routing. Audit asset-directory symlinks and nested `.htaccess` files. The exporter cannot verify your production server configuration.
 
@@ -103,5 +137,5 @@ php tests/exporter.php
 python3 tests/apache.py
 ```
 
-Verified locally on PHP 8.2, 8.3 and 8.4: 375 exporter checks and 270 profile/path checks on each runtime. All 15 real version entry scripts were also exercised against an HTTP fixture. Apache 2.4.69 passed 3480 requests across all profiles at root, subdirectory, encoded-space and Unicode mounts. The documented Apache minimum is based on required directive availability, not a live test of obsolete Apache builds.
+Verified locally on PHP 8.2, 8.3 and 8.4: 623 exporter checks and 270 profile/path checks on each runtime. All 15 real version entry scripts were also exercised against an HTTP fixture. Apache 2.4.69 passed 4588 checks across all profiles at root, subdirectory, encoded-space and Unicode mounts, including hostname-isolated mappings, trusted cross-domain redirects, and real v16 incomplete/all-failed multisite exports. The documented Apache minimum is based on required directive availability, not a live test of obsolete Apache builds.
 Compatibility is based on tagged upstream source, not a claim that obsolete TYPO3 releases are safe to expose publicly.

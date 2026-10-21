@@ -30,6 +30,11 @@ function run(array $profile, array $argv): int
     }
 }
 
+/** A page response that cannot be frozen; unsafe inputs and filesystem faults remain fatal. */
+final class PageCaptureFailure extends RuntimeException
+{
+}
+
 /** Internal engine: no TYPO3 bootstrap, browser state, or HTML transformations. */
 final class Exporter
 {
@@ -39,6 +44,8 @@ final class Exporter
     private const MAX_REDIRECTS = 10;
 
     private string $origin;
+    /** Explicit base URL and sitemap origins only; XML and redirects never extend trust. */
+    private array $origins = [];
     private string $mount;
     private string $output;
     private string $cacheDirectory;
@@ -51,17 +58,33 @@ final class Exporter
 
     public function __construct(private array $profile, private array $options)
     {
-        foreach (['base-url', 'output'] as $required) {
-            if (!isset($options[$required])) {
-                throw new InvalidArgumentException("Missing --$required. Use --help for usage.");
-            }
+        if (!isset($options['output'])) {
+            throw new InvalidArgumentException('Missing --output. Use --help for usage.');
         }
         if (empty($options['urls']) && empty($options['sitemap'])) {
             throw new InvalidArgumentException('Supply at least one --urls or --sitemap source.');
         }
-        $base = self::absoluteUrl($options['base-url'], false);
+        if (!isset($options['base-url'])) {
+            if ($options['urls'] !== []) {
+                throw new InvalidArgumentException('Missing --base-url: required with --urls. Use --help for usage.');
+            }
+            // A sitemap's directory is not necessarily the installation prefix.
+            // Without an explicit base URL, export as a root-mounted installation.
+            foreach ($options['sitemap'] as $url) {
+                self::absoluteUrl($url, true);
+            }
+            $base = self::absoluteUrl($options['sitemap'][0], true);
+            $base['path'] = '/';
+        } else {
+            $base = self::absoluteUrl($options['base-url'], false);
+        }
         $this->origin = $base['origin'];
         $this->mount = rtrim($base['path'], '/');
+        $this->origins[$this->origin] = true;
+        foreach ($options['sitemap'] as $url) {
+            $sitemap = self::absoluteUrl(self::resolveUrl($url, $this->origin . $this->mount . '/'), true);
+            $this->origins[$sitemap['origin']] = true;
+        }
         $this->cacheDirectory = self::relativePath($options['cache-dir'] ?? $profile['cacheDirectory']);
         if (!preg_match('~\A[a-zA-Z0-9_/-]+\z~D', $this->cacheDirectory)) {
             throw new InvalidArgumentException('Cache directory must be a safe relative directory using letters, digits, underscores, hyphens and slashes.');
@@ -77,13 +100,14 @@ final class Exporter
         return <<<'HELP'
 Anonymous full-HTML snapshot exporter (PHP 8.2+; curl, dom and zlib required to export)
 
-Usage: php <wrapper.php> --base-url=https://example.com[/subdir]
-       --urls=urls.txt [--urls=more.txt] [--sitemap=https://example.com/sitemap.xml]
-       --output=/new/empty-staging-directory [options]
+Usage: (sitemaps) php <wrapper.php> --sitemap=https://example.com/sitemap.xml
+                 [--sitemap=https://example.de/sitemap.xml] --output=/new/staging-directory
+Usage (URL lists): php <wrapper.php> --base-url=https://example.com[/subdir]
+                  --urls=urls.txt [--urls=more.txt] --output=/new/staging-directory
 
-  --base-url=URL       Single allowed HTTP(S) origin and optional site mount
+  --base-url=URL       Required with --urls; optional with sitemaps to set origin/mount
   --urls=FILE          UTF-8 URL list; blank lines and # comments ignored (repeatable)
-  --sitemap=URL        Sitemap or sitemap index (repeatable, recursive)
+  --sitemap=URL        Sitemap/index; explicitly trusts its origin for this instance (repeatable)
   --output=DIR         Absent or empty staging directory; no symlink components
   --cache-dir=PATH     Relative document-root cache directory (profile default)
   --resolve=HOST:PORT:ADDRESS  cURL DNS override (repeatable)
@@ -91,14 +115,21 @@ Usage: php <wrapper.php> --base-url=https://example.com[/subdir]
   --allow-set-cookie   Accept cookie-setting anonymous responses; cookies are NEVER sent/replayed
   --help               Show help without requiring curl or XML extensions
 
+Without --base-url, all explicit sitemap URLs must be absolute HTTP(S) URLs.
+The first sitemap supplies the primary origin; the installation mount defaults to /.
+For a subdirectory installation, supply --base-url=https://example.com/subdir.
+URL lists and sitemaps may be combined; --base-url is then required.
 Requests are anonymous, without cookies or credentials; TLS is verified.
-Only same-origin, same-mount redirects are followed. Query/fragment page URLs,
-cookie-setting responses (unless explicitly allowed), authentication paths, and unsafe/colliding paths fail.
-Redirect aliases are not exported; only the terminal HTML page is stored.
+Only explicitly supplied base/sitemap origins and the shared installation mount
+are trusted for pages, child sitemaps and redirects. Query/fragment page URLs,
+authentication paths, and unsafe/colliding paths fail closed. Cookie-setting
+responses are refused unless explicitly allowed. Redirect aliases are not exported.
 Limits: 16 MiB per response, 1000 sitemaps, 50000 pages, 10 redirects.
-On success: full-static.htaccess and manifest.json accompany the cache tree.
-Deploy cache files and the reviewed rules only; do not deploy manifest.json.
-A failed export may leave partial staging files but never a ready rules snippet.
+Page capture failures still produce full-static.htaccess for successful pages only,
+plus manifest.json with complete=false; exit status is nonzero. Missing pages return
+404, never PHP. Even zero successful captures produce deny-by-default rules.
+Fatal input, collision or write errors never publish new rules.
+Review before deploying; deployment is manual. Do not deploy manifest.json.
 
 HELP;
     }
@@ -230,7 +261,7 @@ HELP;
                     'bytes' => strlen($response['body']),
                     'sha256' => hash('sha256', $response['body']),
                 ];
-            } catch (Throwable $error) {
+            } catch (PageCaptureFailure $error) {
                 $failures[] = ['url' => $url, 'error' => $error->getMessage()];
                 fwrite(STDERR, "$url: {$error->getMessage()}\n");
             }
@@ -239,6 +270,7 @@ HELP;
             'profile' => $this->profile['id'],
             'typo3' => $this->profile['typo3'] ?? [],
             'origin' => $this->origin,
+            'origins' => array_keys($this->origins),
             'mountPath' => $this->mount,
             'cacheDirectory' => $this->cacheDirectory,
             'allowSetCookieResponses' => $this->options['allow-set-cookie'],
@@ -247,17 +279,12 @@ HELP;
             'pages' => array_values($this->completed),
             'failures' => $failures,
         ];
-        if ($failures === []) {
-            // Older layouts can retain .xml/.rss/.sfc filenames even for HTML responses.
-            $this->writeFile($this->cacheDirectory . '/.htaccess', "ForceType text/html\nAddDefaultCharset Off\nOptions -Indexes -MultiViews -ExecCGI\n");
-            $rulesProfile = $this->profile;
-            $rulesProfile['pages'] = array_keys($this->completed);
-            $rules = apacheRules($rulesProfile, $this->origin, $this->cacheDirectory, $this->mount);
-        }
+        // Older layouts can retain .xml/.rss/.sfc filenames even for HTML responses.
+        $this->writeFile($this->cacheDirectory . '/.htaccess', "ForceType text/html\nAddDefaultCharset Off\nOptions -Indexes -MultiViews -ExecCGI\nHeader set X-Total-StaticFileCache \"HIT\" \"expr=%{REQUEST_STATUS} == 200 || %{REQUEST_STATUS} == 304\"\n");
+        $rulesProfile = $this->profile;
+        $rulesProfile['pages'] = array_keys($this->completed);
+        $rules = apacheRules($rulesProfile, array_keys($this->origins), $this->cacheDirectory, $this->mount);
         $this->writeFile('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . "\n");
-        if ($failures !== []) {
-            throw new RuntimeException(count($failures) . ' page(s) failed; no full-static.htaccess generated.');
-        }
         try {
             $this->writeFile('full-static.htaccess', $rules);
         } catch (Throwable $error) {
@@ -267,6 +294,9 @@ HELP;
         }
         fwrite(STDOUT, 'Exported ' . count($this->completed) . " HTML page(s) to {$this->output}\n");
         fwrite(STDOUT, "Ready for review: {$this->output}/full-static.htaccess (do not deploy manifest.json).\n");
+        if ($failures !== []) {
+            throw new RuntimeException(count($failures) . ' page(s) failed; incomplete export (manifest complete=false). Review full-static.htaccess before any manual deployment.');
+        }
     }
 
     private function addPage(array &$pages, string $url): void
@@ -327,7 +357,7 @@ HELP;
         $seen = [];
         for ($redirect = 0; $redirect <= self::MAX_REDIRECTS; ++$redirect) {
             if (isset($seen[$url])) {
-                throw new RuntimeException("Redirect cycle: $url");
+                throw new PageCaptureFailure("Redirect cycle: $url");
             }
             $seen[$url] = true;
             if (!$sitemap) {
@@ -341,12 +371,12 @@ HELP;
                 $this->reserve($url);
                 $path = strtolower(rawurldecode((string) parse_url($url, PHP_URL_PATH)));
                 if (preg_match('~/(?:login|log-in|signin|sign-in|typo3)(?:/|$)~', $path)) {
-                    throw new RuntimeException("Authentication path cannot be exported: $url");
+                    throw new InvalidArgumentException("Authentication path cannot be exported: $url");
                 }
                 $relative = ltrim(rawurldecode(substr((string) parse_url($url, PHP_URL_PATH), strlen($this->mount))), '/');
                 foreach (apacheDeniedPaths($this->cacheDirectory) as $pattern) {
                     if (preg_match('~' . $pattern . '~i', $relative)) {
-                        throw new RuntimeException("Static delivery denies page path: $url");
+                        throw new InvalidArgumentException("Static delivery denies page path: $url");
                     }
                 }
             }
@@ -393,17 +423,17 @@ HELP;
                 $ok = curl_exec($handle);
                 $status = curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
                 if ($ok === false) {
-                    throw new RuntimeException($tooLarge ? 'Response exceeds 16 MiB.' : 'HTTP transport error: ' . curl_error($handle));
+                    throw new PageCaptureFailure($tooLarge ? 'Response exceeds 16 MiB.' : 'HTTP transport error: ' . curl_error($handle));
                 }
             } finally {
                 curl_close($handle);
             }
             if (isset($headers['set-cookie']) && !$this->options['allow-set-cookie']) {
-                throw new RuntimeException('Set-Cookie response refused. Review anonymous session content, then use --allow-set-cookie if it is safe to freeze; cookies are never sent or replayed.');
+                throw new PageCaptureFailure('Set-Cookie response refused. Review anonymous session content, then use --allow-set-cookie if it is safe to freeze; cookies are never sent or replayed.');
             }
             if (in_array($status, [301, 302, 303, 307, 308], true)) {
                 if ($redirect === self::MAX_REDIRECTS || count($headers['location'] ?? []) !== 1) {
-                    throw new RuntimeException('Too many redirects or missing/ambiguous Location header.');
+                    throw new PageCaptureFailure('Too many redirects or missing/ambiguous Location header.');
                 }
                 $target = $this->scopedUrl($headers['location'][0], $url, $sitemap);
                 if (!$sitemap) {
@@ -414,23 +444,23 @@ HELP;
                 continue;
             }
             if ($status !== 200) {
-                throw new RuntimeException("Expected HTTP 200, received $status at $url");
+                throw new PageCaptureFailure("Expected HTTP 200, received $status at $url");
             }
             if (!$sitemap) {
                 $type = strtolower(trim(explode(';', $headers['content-type'][0] ?? '')[0]));
                 if ($type !== 'text/html') {
-                    throw new RuntimeException("Expected text/html, received '$type' at $url");
+                    throw new PageCaptureFailure("Expected text/html, received '$type' at $url");
                 }
             } elseif (str_starts_with($body, "\x1f\x8b")) {
                 $decoded = @gzdecode($body, self::MAX_BYTES + 1);
                 if ($decoded === false || strlen($decoded) > self::MAX_BYTES) {
-                    throw new RuntimeException('Invalid or oversized gzip sitemap.');
+                    throw new PageCaptureFailure('Invalid or oversized gzip sitemap.');
                 }
                 $body = $decoded;
             }
             return ['url' => $url, 'body' => $body];
         }
-        throw new RuntimeException('Redirect limit exceeded.');
+        throw new PageCaptureFailure('Redirect limit exceeded.');
     }
 
     private function sitemapEntries(string $xml): array
@@ -484,7 +514,7 @@ HELP;
     {
         $url = self::resolveUrl($reference, $base);
         $parsed = self::absoluteUrl($url, $sitemap);
-        if ($parsed['origin'] !== $this->origin || ($this->mount !== ''
+        if (!isset($this->origins[$parsed['origin']]) || ($this->mount !== ''
             && $parsed['path'] !== $this->mount && !str_starts_with($parsed['path'], $this->mount . '/'))) {
             throw new InvalidArgumentException("URL escapes the allowed origin/site mount: $url");
         }

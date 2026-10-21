@@ -30,10 +30,24 @@ namespace TotalStaticFileCache {
         if ($profile['testMapping'] === 'alias-prefix') {
             return str_ends_with($path, '/parent-alias') ? 'node' : 'node/child';
         }
+        if ($profile['testMapping'] === 'terminal-collision' && in_array($path, ['/site/final/', '/site/child-terminal'], true)) {
+            return 'collision/index';
+        }
+        if ($profile['testMapping'] === 'terminal-unsafe' && $path === '/site/child-terminal') {
+            return '../escaped';
+        }
         $scheme = parse_url($url, PHP_URL_SCHEME);
         $host = parse_url($url, PHP_URL_HOST);
         $port = parse_url($url, PHP_URL_PORT) ?? ($scheme === 'https' ? 443 : 80);
-        return $scheme . '_' . $host . '_' . $port . '/' . ltrim(rtrim(rawurldecode($path), '/') . '/index', '/');
+        $relative = $scheme . '_' . $host . '_' . $port . '/' . ltrim(rtrim(rawurldecode($path), '/') . '/index', '/');
+        if ($profile['testMapping'] === 'page-file' && $path === '/site/final/') {
+            $destination = $profile['testOutput'] . '/' . $profile['cacheDirectory'] . '/' . $relative;
+            if (!is_dir(dirname($destination))) {
+                mkdir(dirname($destination), 0755, true);
+                file_put_contents($destination, 'existing snapshot');
+            }
+        }
+        return $relative;
     }
 }
 
@@ -47,7 +61,7 @@ namespace {
             'id' => 'fixture', 'label' => 'Fixture profile',
             'cacheDirectory' => 'typo3temp/assets/tx_fixture', 'layout' => 'fixture',
             'typo3' => ['major' => 13], 'testMapping' => getenv('EXPORTER_TEST_MAPPING') ?: '',
-            'testOutput' => in_array(getenv('EXPORTER_TEST_MAPPING'), ['rules-file', 'rules-symlink'], true)
+            'testOutput' => in_array(getenv('EXPORTER_TEST_MAPPING'), ['rules-file', 'rules-symlink', 'page-file'], true)
                 ? \TotalStaticFileCache\Exporter::options($argv)['output'] : '',
         ], $argv));
     }
@@ -62,11 +76,11 @@ namespace {
         }
     }
 
-    function command(array $arguments, array $phpFlags = [], string $mapping = '', bool $limited = false): array
+    function command(array $arguments, array $phpFlags = [], string $mapping = '', bool $limited = false, ?string $wrapper = null): array
     {
         $cli = $limited
             ? ['/bin/sh', '-c', 'trap "" XFSZ; ulimit -f 4; exec "$@"', 'sh', PHP_BINARY, __DIR__ . '/../staticfilecache-v13.php', ...$arguments]
-            : [PHP_BINARY, ...$phpFlags, __FILE__, '--export-child', ...$arguments];
+            : [PHP_BINARY, ...$phpFlags, ...($wrapper === null ? [__FILE__, '--export-child'] : [__DIR__ . '/../' . $wrapper . '.php']), ...$arguments];
         $process = proc_open($cli,
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null,
             array_merge(getenv(), ['EXPORTER_TEST_MAPPING' => $mapping]));
@@ -148,7 +162,7 @@ namespace {
             '--sitemap=' . $origin . '/site/index.xml', '--sitemap=' . $origin . '/site/index.xml',
             '--cache-dir=custom/cache', '--output=' . $success]);
         check($status === 0, "Export should succeed: $stdout $stderr");
-        check(file_get_contents($success . '/custom/cache/.htaccess') === "ForceType text/html\nAddDefaultCharset Off\nOptions -Indexes -MultiViews -ExecCGI\n", 'Every captured HTML response must keep an HTML MIME type, including legacy extension-preserving layouts.');
+        check(file_get_contents($success . '/custom/cache/.htaccess') === "ForceType text/html\nAddDefaultCharset Off\nOptions -Indexes -MultiViews -ExecCGI\nHeader set X-Total-StaticFileCache \"HIT\" \"expr=%{REQUEST_STATUS} == 200 || %{REQUEST_STATUS} == 304\"\n", 'Every captured HTML response must keep an HTML MIME type, including legacy extension-preserving layouts.');
         check($stderr === '', 'Successful export must have no diagnostics.');
         check(str_contains($stdout, 'Exported 6 HTML page(s)'), 'Six unique terminal pages must be reported.');
         $body = '<!doctype html><html lang="de"><head><title>Snapshot</title></head><body>Grüße 🌍<!-- full document --><section id="plugin">rendered anonymously: 7</section><script>window.plugin={"html":"<b>unmodified</b>"};</script></body></html>';
@@ -202,12 +216,13 @@ namespace {
         check(file_get_contents($temp . '/prefix-alias/typo3temp/assets/tx_fixture/node/child') === $body, 'Terminal may safely occupy a former alias directory.');
 
         $serial = 0;
-        $failure = static function (array $arguments, string $expected, string $mapping = '', ?string $out = null) use (&$serial, $common, $temp): array {
+        $failure = static function (array $arguments, string $expected, string $mapping = '', ?string $out = null, bool $partial = false) use (&$serial, $common, $temp): array {
             $out ??= $temp . '/failure-' . ++$serial;
             [$status, $stdout, $stderr] = command([...$common, ...$arguments, '--output=' . $out], [], $mapping);
             check($status !== 0, 'Expected export failure: ' . implode(' ', $arguments));
             check(str_contains($stderr, $expected), "Expected diagnostic '$expected', got: $stderr");
-            check(!file_exists($out . '/full-static.htaccess') && !str_contains($stdout, 'Ready for review:'), 'A failed export must never generate/announce ready rules.');
+            check(is_file($out . '/full-static.htaccess') === $partial && str_contains($stdout, 'Ready for review:') === $partial,
+                $partial ? 'Page capture failures must still publish reviewable static rules.' : 'Fatal errors must never generate/announce ready rules.');
             return [$out, $stderr];
         };
         $requestCount = static fn (): int => count(file($log, FILE_IGNORE_NEW_LINES));
@@ -234,11 +249,15 @@ namespace {
 
         foreach (['cross-origin' => 'origin/site mount', 'cross-port' => 'origin/site mount', 'cross-scheme' => 'origin/site mount',
             'outside' => 'origin/site mount', 'redirect-query' => 'query/fragment', 'redirect-traversal' => 'Dot traversal',
-            'login-redirect' => 'Authentication path', 'cookie' => 'Set-Cookie', 'cookie-redirect' => 'Set-Cookie',
+            'login-redirect' => 'Authentication path'] as $route => $expected) {
+            file_put_contents($list, "/site/final/\n/site/" . $route . "\n");
+            $failure(['--urls=' . $list], $expected);
+        }
+        foreach (['cookie' => 'Set-Cookie', 'cookie-redirect' => 'Set-Cookie',
             'unauthorized' => 'received 401', 'error' => 'received 500', 'not-found' => 'received 404', 'plain' => 'Expected text/html',
             'loop' => 'Redirect cycle', 'many-redirects/0' => 'Too many redirects', 'large' => 'exceeds 16 MiB'] as $route => $expected) {
             file_put_contents($list, '/site/' . $route . "\n");
-            [$out] = $failure(['--urls=' . $list], $expected);
+            [$out] = $failure(['--urls=' . $list], $expected, '', null, true);
             $manifest = json_decode(file_get_contents($out . '/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
             check($manifest['complete'] === false && $manifest['pages'] === [] && count($manifest['failures']) === 1, 'Failed page must not enter the cache manifest.');
         }
@@ -253,11 +272,93 @@ namespace {
         check(!str_contains(file_get_contents($log), '"uri":"\\/site\\/login\\/"'), 'Login redirect target must not be requested.');
         check(!str_contains(file_get_contents($log), '"uri":"\\/outside'), 'Outside-mount redirect target must not be requested.');
 
-        // Mixed results still record failures and withhold the rules snippet.
+        // Mixed results publish only successful mappings; the caller decides whether to deploy.
         file_put_contents($list, "/site/final/\n/site/error\n/site/list/\n");
-        [$out] = $failure(['--urls=' . $list], '1 page(s) failed');
+        [$out] = $failure(['--urls=' . $list], '1 page(s) failed', '', null, true);
         $manifest = json_decode(file_get_contents($out . '/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
-        check(count($manifest['pages']) === 2 && count($manifest['failures']) === 1, 'Exporter must report failures while allowing partial staging.');
+        check($manifest['complete'] === false && count($manifest['pages']) === 2 && count($manifest['failures']) === 1, 'Exporter must report failures while publishing successful mappings.');
+        $partialRules = file_get_contents($out . '/full-static.htaccess');
+        check(str_contains($partialRules, '/site/final/') && str_contains($partialRules, '/site/list/') && !str_contains($partialRules, '/site/error'), 'Failed pages must never appear in Apache mappings.');
+
+        // Explicit sitemap origins define one instance, independent of discovery order.
+        $secondOrigin = 'http://second.test:' . $port;
+        $multiTrust = ['--resolve=second.test:' . $port . ':127.0.0.1'];
+        $multi = [...$common, ...$multiTrust];
+        $sources = ['--sitemap=' . $origin . '/site/instance.xml', '--sitemap=' . $secondOrigin . '/site/instance.xml'];
+        foreach (range(2, 16) as $major) {
+            $wrapper = ($major === 2 ? 'nc_staticfilecache' : 'staticfilecache') . '-v' . $major;
+            $out = $temp . '/multi-' . $major;
+            [$status, $stdout, $stderr] = command([...$multi, ...$sources, '--output=' . $out], [], '', false, $wrapper);
+            check($status === 0 && $stderr === '', "$wrapper multi-origin export must succeed: $stderr");
+            $manifest = json_decode(file_get_contents($out . '/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
+            check($manifest['origin'] === $origin && $manifest['origins'] === [$origin, $secondOrigin] && $manifest['mountPath'] === '/site', 'Manifest must retain primary-origin compatibility and list only explicit origins.');
+            check($manifest['profile'] === $wrapper && $manifest['complete'] === true && count($manifest['pages']) === 6, 'One manifest must cover both domains and terminal redirects.');
+            $byUrl = array_column($manifest['pages'], null, 'url');
+            foreach ([$origin, $secondOrigin] as $domain) {
+                $page = $byUrl[$domain . '/site/shared/'];
+                check(file_get_contents($out . '/' . $page['file']) === $body . '<!-- ' . $domain . ' -->', 'Same path on different domains must preserve distinct full HTML.');
+                check(str_starts_with($page['file'], $manifest['cacheDirectory'] . '/'), 'Both hosts must use the one shared cache root.');
+                check(isset($byUrl[$domain . '/site/terminal/']) && !isset($byUrl[$domain . '/site/trusted-page-redirect']), 'Trusted cross-origin page redirects must store terminal URLs only.');
+            }
+            $rules = file_get_contents($out . '/full-static.htaccess');
+            check(str_contains($rules, 'RewriteCond %{HTTP_HOST} ^fixture\\.test:' . $port . '$ [NC]')
+                && str_contains($rules, 'RewriteCond %{HTTP_HOST} ^second\\.test:' . $port . '$ [NC]'), 'Each domain must have host-bound Apache mappings.');
+            check($byUrl[$origin . '/site/shared/']['file'] !== $byUrl[$secondOrigin . '/site/shared/']['file'], 'Domain cache paths must not overwrite each other.');
+            $inferred = $temp . '/inferred-' . $major;
+            [$status, , $stderr] = command(['--resolve=fixture.test:' . $port . ':127.0.0.1', ...$multiTrust,
+                ...$sources, '--output=' . $inferred], [], '', false, $wrapper);
+            check($status === 0 && $stderr === '', "$wrapper sitemap-only export must not require --base-url: $stderr");
+            $inferredManifest = json_decode(file_get_contents($inferred . '/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
+            check($inferredManifest['origin'] === $origin && $inferredManifest['origins'] === [$origin, $secondOrigin]
+                && $inferredManifest['mountPath'] === '' && $inferredManifest['complete'] === true
+                && count($inferredManifest['pages']) === 6, 'Sitemap-only exports must infer the first origin, preserve all trusted domains and default to a root mount, not the sitemap directory.');
+        }
+        foreach ([
+            [['--urls=' . $list], '--base-url'],
+            [['--urls=' . $list, ...$sources], '--base-url'],
+            [['--sitemap=/site/instance.xml'], 'HTTP(S)'],
+            [[...$sources, '--sitemap=/site/instance.xml'], 'HTTP(S)'],
+        ] as $case => [$arguments, $expected]) {
+            $out = $temp . '/missing-base-' . $case;
+            [$status, , $stderr] = command([...$arguments, '--output=' . $out]);
+            check($status !== 0 && str_contains($stderr, $expected), 'Missing base URLs for lists and relative explicit sitemap URLs must fail clearly.');
+            check(!file_exists($out), 'Invalid source configuration must fail before creating output or making requests.');
+        }
+        // Even with failures on another domain, successful pages get reviewable rules.
+        [$out] = $failure([...$multiTrust, '--sitemap=' . $origin . '/site/instance-pages.xml',
+            '--sitemap=' . $secondOrigin . '/site/instance-failure.xml'], '1 page(s) failed', '', null, true);
+        $manifest = json_decode(file_get_contents($out . '/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
+        check($manifest['complete'] === false && count($manifest['pages']) === 4
+            && $manifest['failures'][0]['url'] === $secondOrigin . '/site/error', 'One failed domain page must be reported without dropping successful pages from either domain.');
+        $rules = file_get_contents($out . '/full-static.htaccess');
+        check(!str_contains($rules, '/site/error') && str_contains($rules, '/site/shared/'), 'Only successful multisite pages belong in the rules.');
+
+        // Discovering a host in XML never trusts it, nor does trusting a host allow another mount.
+        foreach (['instance.xml', 'external-page.xml'] as $sitemap) {
+            $failure(['--sitemap=' . $origin . '/site/' . $sitemap], 'origin/site mount');
+        }
+        $failure([...$multiTrust, '--sitemap=' . $origin . '/site/trusted-outside.xml',
+            '--sitemap=' . $secondOrigin . '/site/empty.xml'], 'origin/site mount');
+        file_put_contents($list, $origin . "/site/trusted-outside\n");
+        $failure([...$multiTrust, '--urls=' . $list, '--sitemap=' . $secondOrigin . '/site/instance-failure.xml'], 'origin/site mount');
+        file_put_contents($list, $secondOrigin . "/site/shared/\n");
+        $failure(['--urls=' . $list], 'origin/site mount');
+        $failure(['--sitemap=' . $secondOrigin . '/outside.xml'], 'origin/site mount');
+        $failure(['--sitemap=http://user:secret@second.test:' . $port . '/site/instance.xml'], 'credential-free');
+        $requests = array_map(static fn ($line) => json_decode($line, true, 512, JSON_THROW_ON_ERROR), file($log, FILE_IGNORE_NEW_LINES));
+        check(count(array_filter($requests, static fn ($r) => $r['origin'] === $secondOrigin && $r['uri'] === '/site/instance-child-redirect')) > 0, 'Trusted cross-origin child sitemap references must actually be fetched.');
+        check(count(array_filter($requests, static fn ($r) => $r['origin'] === $secondOrigin && str_starts_with($r['uri'], '/outside'))) === 0, 'Trusted domains must still enforce the installation mount.');
+        check(!str_contains(file_get_contents($log), 'other.invalid'), 'Untrusted redirect, page and sitemap domains must never be requested.');
+
+        // Fatal errors after a successful capture must not be downgraded to partial exports.
+        file_put_contents($list, "/site/list/\n/site/final/\n");
+        [$out] = $failure(['--urls=' . $list], 'Cannot exclusively publish file:', 'page-file');
+        check(file_get_contents($out . '/typo3temp/assets/tx_fixture/http_fixture.test_' . $port . '/site/final/index') === 'existing snapshot', 'Page write conflicts must preserve existing bytes.');
+        check(!file_exists($out . '/manifest.json'), 'Fatal page writes must not leave a release manifest.');
+        foreach (['terminal-collision' => 'Cache path collision', 'terminal-unsafe' => 'Unsafe relative cache path'] as $mapping => $expected) {
+            file_put_contents($list, "/site/final/\n/site/parent-alias\n");
+            $failure(['--urls=' . $list], $expected, $mapping);
+        }
 
         file_put_contents($list, "/site/final/\n");
         $before = $requestCount();
@@ -299,16 +400,18 @@ namespace {
         check(($limitedManifest['complete'] ?? false) === false, 'Failed rules publication must not leave a complete manifest.');
 
         // Simulate a destination appearing after the initial empty-directory check.
-        file_put_contents($list, "/site/final/\n");
         foreach (['rules-file', 'rules-symlink'] as $mapping) {
-            $out = $temp . '/' . $mapping;
-            file_put_contents($out . '-sentinel', 'existing rules');
-            [$status, $stdout, $stderr] = command([...$common, '--urls=' . $list, '--output=' . $out], [], $mapping);
-            check($status === 1 && !str_contains($stdout, 'Ready for review:'), 'Existing deployment rules must prevent publication.');
-            check(str_contains($stderr, $mapping === 'rules-file' ? 'Cannot exclusively publish file:' : 'Symlink file refused:'), 'Existing destinations must fail with an exclusive-publication diagnostic: ' . $stderr);
-            check(file_get_contents($out . '/full-static.htaccess') === 'existing rules' && file_get_contents($out . '-sentinel') === 'existing rules', 'Existing files and symlink targets must never be overwritten.');
-            check(is_link($out . '/full-static.htaccess') === ($mapping === 'rules-symlink'), 'Publication must not replace an existing symlink.');
-            check(!file_exists($out . '/manifest.json') && array_diff(scandir($out), ['.', '..', 'full-static.htaccess', 'typo3temp']) === [], 'Failed publication must remove its complete manifest and temporary sibling.');
+            foreach ([false, true] as $incomplete) {
+                file_put_contents($list, "/site/final/\n" . ($incomplete ? "/site/error\n" : ''));
+                $out = $temp . '/' . $mapping . ($incomplete ? '-incomplete' : '');
+                file_put_contents($out . '-sentinel', 'existing rules');
+                [$status, $stdout, $stderr] = command([...$common, '--urls=' . $list, '--output=' . $out], [], $mapping);
+                check($status === 1 && !str_contains($stdout, 'Ready for review:'), 'Existing deployment rules must prevent publication, including incomplete exports.');
+                check(str_contains($stderr, $mapping === 'rules-file' ? 'Cannot exclusively publish file:' : 'Symlink file refused:'), 'Existing destinations must fail with an exclusive-publication diagnostic: ' . $stderr);
+                check(file_get_contents($out . '/full-static.htaccess') === 'existing rules' && file_get_contents($out . '-sentinel') === 'existing rules', 'Existing files and symlink targets must never be overwritten.');
+                check(is_link($out . '/full-static.htaccess') === ($mapping === 'rules-symlink'), 'Publication must not replace an existing symlink.');
+                check(!file_exists($out . '/manifest.json') && array_diff(scandir($out), ['.', '..', 'full-static.htaccess', 'typo3temp']) === [], 'Failed publication must remove its manifest and temporary sibling.');
+            }
         }
 
         // The static rules and exporter must agree, including after redirects and below a mount.
@@ -333,7 +436,9 @@ namespace {
         file_put_contents($list, "/site/slow\n");
         [$status, $stdout, $stderr] = command(['--base-url=' . $origin . '/site', '--urls=' . $list,
             '--resolve=fixture.test:' . $port . ':127.0.0.1', '--timeout=1', '--output=' . $temp . '/timeout']);
-        check($status !== 0 && str_contains($stderr, 'HTTP transport error') && !file_exists($temp . '/timeout/full-static.htaccess'), 'Request timeouts must fail without ready rules.');
+        check($status !== 0 && str_contains($stderr, 'HTTP transport error') && is_file($temp . '/timeout/full-static.htaccess'), 'Request timeouts must report failure but still publish deny-by-default rules.');
+        $timeoutManifest = json_decode(file_get_contents($temp . '/timeout/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
+        check($timeoutManifest['complete'] === false && $timeoutManifest['pages'] === [] && count($timeoutManifest['failures']) === 1, 'All-failed export must retain an incomplete report and no page mappings.');
         fwrite(STDOUT, "OK: $checks exporter checks (real CLI subprocesses and HTTP fixture).\n");
     } finally {
         if (is_resource($server)) {

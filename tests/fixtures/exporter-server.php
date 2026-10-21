@@ -5,6 +5,7 @@ declare(strict_types=1);
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $origin = 'http://' . $_SERVER['HTTP_HOST'];
 file_put_contents(getenv('EXPORTER_REQUEST_LOG'), json_encode([
+    'origin' => $origin,
     'uri' => $_SERVER['REQUEST_URI'],
     'cookie' => $_SERVER['HTTP_COOKIE'] ?? null,
     'authorization' => $_SERVER['HTTP_AUTHORIZATION'] ?? null,
@@ -23,8 +24,28 @@ $index = static function (array $urls) use ($loc): string {
         . implode('', array_map(static fn ($url) => '<sitemap><loc>' . $loc($url) . '</loc></sitemap>', $urls)) . '</sitemapindex>';
 };
 
+$otherOrigin = 'http://' . (str_starts_with($_SERVER['HTTP_HOST'], 'fixture.test:') ? 'second.test:' : 'fixture.test:') . $_SERVER['SERVER_PORT'];
+
 header('Content-Type: application/xml');
 switch ($path) {
+    case '/site/instance.xml':
+        echo $index([$origin . '/site/instance-pages.xml', $otherOrigin . '/site/instance-child-redirect']);
+        return;
+    case '/site/instance-child-redirect':
+        header('Location: ' . $otherOrigin . '/site/instance-pages.xml', true, 302);
+        return;
+    case '/site/instance-pages.xml':
+        echo $set([$origin . '/site/shared/', $origin . '/site/' . (str_starts_with($_SERVER['HTTP_HOST'], 'fixture.test:') ? 'primary-only/' : 'secondary-only/'), $origin . '/site/trusted-page-redirect']);
+        return;
+    case '/site/instance-failure.xml':
+        echo $set([$origin . '/site/shared/', $origin . '/site/error']);
+        return;
+    case '/site/external-page.xml':
+        echo $set(['http://other.invalid/site/shared/']);
+        return;
+    case '/site/trusted-outside.xml':
+        echo $index([$otherOrigin . '/outside.xml']);
+        return;
     case '/site/index.xml':
         echo $index([$origin . '/site/pages.xml?chunk=1&source=test', $origin . '/site/index.xml', $origin . '/site/plain.xml.gz', $origin . '/site/encoded.xml']);
         return;
@@ -99,6 +120,12 @@ switch ($path) {
         header('Location: final/', true, 301);
         echo 'Redirect body must not be cached';
         return;
+    case '/site/trusted-page-redirect':
+        header('Location: ' . $otherOrigin . '/site/terminal/', true, 302);
+        return;
+    case '/site/trusted-outside':
+        header('Location: ' . $otherOrigin . '/outside/', true, 302);
+        return;
     case '/site/cross-origin':
         header('Location: http://other.invalid/site/final/', true, 302);
         return;
@@ -152,3 +179,6 @@ switch ($path) {
 }
 
 echo '<!doctype html><html lang="de"><head><title>Snapshot</title></head><body>Grüße 🌍<!-- full document --><section id="plugin">rendered anonymously: 7</section><script>window.plugin={"html":"<b>unmodified</b>"};</script></body></html>';
+if (in_array($path, ['/site/shared/', '/site/primary-only/', '/site/secondary-only/', '/site/terminal/'], true)) {
+    echo '<!-- ' . $origin . ' -->';
+}

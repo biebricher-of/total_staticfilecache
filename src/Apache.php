@@ -5,29 +5,26 @@ declare(strict_types=1);
 namespace TotalStaticFileCache;
 
 /** Generate a replacement document-root .htaccess, not an addition to TYPO3's PHP router. */
-function apacheRules(array $profile, string $origin, string $cacheDirectory, string $mountPath): string
+function apacheRules(array $profile, string|array $origin, string $cacheDirectory, string $mountPath): string
 {
-    $parts = parse_url($origin);
-    if (!is_array($parts) || !isset($parts['host'], $parts['scheme'])) {
-        throw new \InvalidArgumentException('Invalid public origin.');
+    $origins = is_array($origin) ? $origin : [$origin];
+    if ($origins === []) {
+        throw new \InvalidArgumentException('At least one public origin is required.');
     }
+    $hostPatterns = array_values(array_unique(array_map(__NAMESPACE__ . '\\apacheHostPattern', $origins)));
     if (!preg_match('~\A[a-zA-Z0-9_/-]+\z~D', $cacheDirectory)
         || str_contains($cacheDirectory, '..') || str_starts_with($cacheDirectory, '/')) {
         throw new \InvalidArgumentException('Cache directory must be a safe relative directory.');
     }
     $pages = $profile['pages'] ?? null;
-    if (!is_array($pages) || $pages === []) {
-        throw new \InvalidArgumentException('Apache generation requires the successfully exported page URLs in profile[pages].');
+    if (!is_array($pages)) {
+        throw new \InvalidArgumentException('Apache generation requires the successfully exported page URLs in profile[pages] (may be empty).');
     }
     $mount = rtrim($mountPath, '/');
-    $authority = strtolower($parts['host']);
-    $port = $parts['port'] ?? ($parts['scheme'] === 'https' ? 443 : 80);
-    $defaultPort = $parts['scheme'] === 'https' ? 443 : 80;
-    $hostPattern = preg_quote($authority, '~') . ($port === $defaultPort ? '(?::' . $port . ')?' : ':' . $port);
     $lines = [
         '# Generated full-static configuration for ' . $profile['label'],
         '# REPLACE the TYPO3 document-root .htaccess; do not append this below its front controller.',
-        '# Apache >= 2.4, mod_rewrite, mod_mime, AllowOverride FileInfo Options Indexes required.',
+        '# Apache >= 2.4.10, mod_rewrite, mod_mime, mod_headers, AllowOverride FileInfo Options Indexes required.',
         '# For a subdirectory installation, put this file in that installation directory.',
         '# No public PHP, including backend. Rebuild via a separate protected rendering endpoint.',
         'Options -Indexes -MultiViews -ExecCGI',
@@ -44,8 +41,8 @@ function apacheRules(array $profile, string $origin, string $cacheDirectory, str
         '</FilesMatch>',
         'RewriteEngine On',
         '',
-        '# Pin the hostname; forwarded host headers are deliberately not trusted.',
-        'RewriteCond %{HTTP_HOST} !^' . $hostPattern . '$ [NC]',
+        '# Pin the instance hostnames; forwarded host headers are deliberately not trusted.',
+        'RewriteCond %{HTTP_HOST} !^(?:' . implode('|', $hostPatterns) . ')$ [NC]',
         'RewriteRule ^ - [R=404,END]',
         '',
         '# No state-changing requests or query variants of frozen pages.',
@@ -69,6 +66,7 @@ function apacheRules(array $profile, string $origin, string $cacheDirectory, str
         $target = $mount . implode('/', array_map('rawurlencode', explode('/', $suffix)));
         // A literal percent must not be interpreted as a RewriteCond %N backreference.
         $target = str_replace('%', '\\%', $target);
+        $lines[] = 'RewriteCond %{HTTP_HOST} ^' . apacheHostPattern($url) . '$ [NC]';
         $lines[] = 'RewriteCond %{QUERY_STRING} ^$';
         $lines[] = 'RewriteCond %{THE_REQUEST} "^[A-Z]+\\x20' . apacheRegex($path) . '(?:\\x20|\\?)"';
         $lines[] = 'RewriteRule ^ "' . $target . '" [NE,END]';
@@ -89,6 +87,19 @@ function apacheRules(array $profile, string $origin, string $cacheDirectory, str
         ''
     );
     return implode("\n", $lines);
+}
+
+/** Match a public URL's authority, including only its explicit or default port. */
+function apacheHostPattern(string $url): string
+{
+    $parts = parse_url($url);
+    if (!is_array($parts) || !isset($parts['host'], $parts['scheme'])
+        || !in_array($parts['scheme'], ['http', 'https'], true)) {
+        throw new \InvalidArgumentException('Invalid public origin.');
+    }
+    $port = $parts['port'] ?? ($parts['scheme'] === 'https' ? 443 : 80);
+    $defaultPort = $parts['scheme'] === 'https' ? 443 : 80;
+    return preg_quote(strtolower($parts['host']), '~') . ($port === $defaultPort ? '(?::' . $port . ')?' : ':' . $port);
 }
 
 /** Shared by the exporter and per-directory Apache rules, after URL decoding and mount removal. */
