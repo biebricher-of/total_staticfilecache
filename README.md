@@ -144,3 +144,51 @@ python3 tests/apache.py
 
 Verified locally on PHP 8.2, 8.3 and 8.4: 623 exporter checks and 270 profile/path checks on each runtime. All 15 real version entry scripts were also exercised against an HTTP fixture. Apache 2.4.69 passed 4588 checks across all profiles at root, subdirectory, encoded-space and Unicode mounts, including hostname-isolated mappings, trusted cross-domain redirects, and real v16 incomplete/all-failed multisite exports. The documented Apache minimum is based on required directive availability, not a live test of obsolete Apache builds.
 Compatibility is based on tagged upstream source, not a claim that obsolete TYPO3 releases are safe to expose publicly.
+
+## Prompt for supporting a new upstream release
+
+```text
+Update https://github.com/biebricher-of/total_staticfilecache for the latest
+stable release of https://github.com/lochmueller/staticfilecache.
+
+Inspect the project, COMPATIBILITY.md, and existing version profiles.
+Identify the latest stable upstream release and compare its tagged source
+with the newest release currently supported.
+
+Verify from upstream source:
+- TYPO3 and PHP compatibility requirements.
+- Cache directory, filename/path generation, URL encoding, and file types.
+- Apache delivery rules and changes affecting static snapshots.
+
+Make only the changes required for compatibility:
+- For a new extension major, add a matching CLI entry script and profile,
+  following existing conventions.
+- For a minor or patch release, update existing support only if necessary.
+- Update COMPATIBILITY.md with exact release tags, source references, and
+  limitations. Do not infer compatibility from version numbers alone.
+- Update README.md where usage or requirements have changed.
+
+Preserve these contracts:
+- Export complete anonymously rendered HTML, including uncached plugin output.
+- Support multiple explicitly supplied sitemap domains belonging to one
+  TYPO3 instance, with hostname-isolated snapshots.
+- Keep --base-url optional for root-mounted sitemap exports; use it to specify
+  the shared installation prefix for subdirectory installations.
+- Preserve existing version support and fail-closed validation.
+- Serve only exported pages and allowed public assets, without PHP fallback.
+- Keep PHP endpoints and private TYPO3 paths inaccessible.
+- Send X-Total-StaticFileCache: HIT only for successful cached HTML responses,
+  including conditional 304 responses; do not change browser cache policy.
+- Retain GPL-3.0 licensing and the upstream README reference.
+
+Add regression tests for changed behavior. Run exporter and profile tests
+on the documented PHP runtimes, plus the real Apache integration tests.
+Exercise any new entry script against the HTTP fixture.
+Report actual results and clearly identify anything not verified.
+
+Exclude credentials, exported customer content, and local development artifacts.
+Do not commit, push, publish, or deploy without my approval.
+
+Finish with a concise summary of upstream changes, project changes,
+verification results, and manual deployment considerations.
+```
