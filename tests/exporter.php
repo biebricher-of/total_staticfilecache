@@ -2,12 +2,19 @@
 
 declare(strict_types=1);
 
-// The core intentionally receives these functions from its version wrapper.
-// Keep this harness independent of the real profile/rules implementation.
+// Exercise the core with controllable cache mappings and the real Apache rules.
 namespace TotalStaticFileCache {
     function cacheFile(array $profile, string $url): string
     {
         $path = parse_url($url, PHP_URL_PATH);
+        if (isset($profile['pages']) && in_array($profile['testMapping'], ['rules-file', 'rules-symlink'], true)) {
+            $destination = $profile['testOutput'] . '/full-static.htaccess';
+            if ($profile['testMapping'] === 'rules-file') {
+                file_put_contents($destination, 'existing rules');
+            } else {
+                symlink($profile['testOutput'] . '-sentinel', $destination);
+            }
+        }
         if ($profile['testMapping'] === 'unsafe') {
             return '../escaped';
         }
@@ -28,18 +35,11 @@ namespace TotalStaticFileCache {
         $port = parse_url($url, PHP_URL_PORT) ?? ($scheme === 'https' ? 443 : 80);
         return $scheme . '_' . $host . '_' . $port . '/' . ltrim(rtrim(rawurldecode($path), '/') . '/index', '/');
     }
-
-    function apacheRules(array $profile, string $origin, string $cacheDirectory, string $mountPath): string
-    {
-        if (empty($profile['pages']) || array_filter($profile['pages'], static fn ($url) => str_ends_with($url, '/site/old'))) {
-            throw new \RuntimeException('Rules require successfully exported terminal URLs only.');
-        }
-        return "# fixture apache rules\n$origin\n$cacheDirectory\n$mountPath\n";
-    }
 }
 
 namespace {
     require __DIR__ . '/../src/Exporter.php';
+    require __DIR__ . '/../src/Apache.php';
 
     if (($argv[1] ?? '') === '--export-child') {
         array_splice($argv, 1, 1);
@@ -47,6 +47,8 @@ namespace {
             'id' => 'fixture', 'label' => 'Fixture profile',
             'cacheDirectory' => 'typo3temp/assets/tx_fixture', 'layout' => 'fixture',
             'typo3' => ['major' => 13], 'testMapping' => getenv('EXPORTER_TEST_MAPPING') ?: '',
+            'testOutput' => in_array(getenv('EXPORTER_TEST_MAPPING'), ['rules-file', 'rules-symlink'], true)
+                ? \TotalStaticFileCache\Exporter::options($argv)['output'] : '',
         ], $argv));
     }
 
@@ -60,9 +62,12 @@ namespace {
         }
     }
 
-    function command(array $arguments, array $phpFlags = [], string $mapping = ''): array
+    function command(array $arguments, array $phpFlags = [], string $mapping = '', bool $limited = false): array
     {
-        $process = proc_open([PHP_BINARY, ...$phpFlags, __FILE__, '--export-child', ...$arguments],
+        $cli = $limited
+            ? ['/bin/sh', '-c', 'trap "" XFSZ; ulimit -f 4; exec "$@"', 'sh', PHP_BINARY, __DIR__ . '/../staticfilecache-v13.php', ...$arguments]
+            : [PHP_BINARY, ...$phpFlags, __FILE__, '--export-child', ...$arguments];
+        $process = proc_open($cli,
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null,
             array_merge(getenv(), ['EXPORTER_TEST_MAPPING' => $mapping]));
         if (!is_resource($process)) {
@@ -152,7 +157,8 @@ namespace {
             check(file_get_contents($cacheRoot . '/' . $path) === $body, "Full UTF-8/plugin body must be preserved: $path");
         }
         check(!file_exists($cacheRoot . '/site/old/index'), 'Redirect alias/body must not be exported.');
-        check(file_get_contents($success . '/full-static.htaccess') === "# fixture apache rules\n$origin\ncustom/cache\n/site\n", 'Rules generator must receive origin, cache override, and mount.');
+        $rules = file_get_contents($success . '/full-static.htaccess');
+        check(str_contains($rules, '/site/custom/cache/http_fixture.test_') && !str_contains($rules, '/site/old'), 'Rules must map only completed terminal URLs using the supplied mount and cache override.');
         $manifest = json_decode(file_get_contents($success . '/manifest.json'), true, 512, JSON_THROW_ON_ERROR);
         check($manifest['complete'] === true && count($manifest['pages']) === 6 && $manifest['failures'] === [], 'Manifest must describe completed terminal pages.');
         check($manifest['pages'][0]['bytes'] === strlen($body) && $manifest['pages'][0]['sha256'] === hash('sha256', $body), 'Manifest must reflect actual body bytes/hash.');
@@ -277,9 +283,52 @@ namespace {
         [$status, $stdout, $stderr] = command(['--base-url=' . $origin, '--urls=' . $list,
             '--resolve=fixture.test:' . $port . ':127.0.0.1', '--output=' . $temp . '/root']);
         check($status === 0 && $stderr === '', 'Root mount export must succeed: ' . $stderr);
-        check(file_get_contents($temp . '/root/full-static.htaccess') === "# fixture apache rules\n$origin\ntypo3temp/assets/tx_fixture\n\n", 'Root mount must pass an empty mountPath and profile cache default.');
+        check(str_contains(file_get_contents($temp . '/root/full-static.htaccess'), '/typo3temp/assets/tx_fixture/http_fixture.test_'), 'Root mount must use the profile cache default.');
         [$status, , $stderr] = command([...$common, '--sitemap=' . $origin . '/site/sitemap-redirect', '--output=' . $temp . '/sitemap-redirect']);
         check($status === 0 && $stderr === '', 'Same-scope sitemap redirects must work: ' . $stderr);
+
+        // Real wrapper: the page and manifest fit, but the deployment rules exceed RLIMIT_FSIZE.
+        file_put_contents($list, "/\n");
+        $limitedOutput = $temp . '/limited';
+        [$status, $stdout, $stderr] = command(['--base-url=' . $origin, '--urls=' . $list,
+            '--resolve=fixture.test:' . $port . ':127.0.0.1', '--output=' . $limitedOutput], [], '', true);
+        check($status === 1 && str_contains($stderr, 'Cannot write file: ' . $limitedOutput . '/full-static.htaccess'), 'A limited rules write must fail normally, not terminate on SIGXFSZ: ' . $stderr);
+        check(!file_exists($limitedOutput . '/full-static.htaccess') && !str_contains($stdout, 'Ready for review:'), 'A short rules write must never expose or announce the final deployment filename.');
+        check(array_diff(scandir($limitedOutput), ['.', '..', 'manifest.json', 'typo3temp']) === [], 'Failed publication must not leave temporary sibling files.');
+        $limitedManifest = is_file($limitedOutput . '/manifest.json') ? json_decode(file_get_contents($limitedOutput . '/manifest.json'), true, 512, JSON_THROW_ON_ERROR) : null;
+        check(($limitedManifest['complete'] ?? false) === false, 'Failed rules publication must not leave a complete manifest.');
+
+        // Simulate a destination appearing after the initial empty-directory check.
+        file_put_contents($list, "/site/final/\n");
+        foreach (['rules-file', 'rules-symlink'] as $mapping) {
+            $out = $temp . '/' . $mapping;
+            file_put_contents($out . '-sentinel', 'existing rules');
+            [$status, $stdout, $stderr] = command([...$common, '--urls=' . $list, '--output=' . $out], [], $mapping);
+            check($status === 1 && !str_contains($stdout, 'Ready for review:'), 'Existing deployment rules must prevent publication.');
+            check(str_contains($stderr, $mapping === 'rules-file' ? 'Cannot exclusively publish file:' : 'Symlink file refused:'), 'Existing destinations must fail with an exclusive-publication diagnostic: ' . $stderr);
+            check(file_get_contents($out . '/full-static.htaccess') === 'existing rules' && file_get_contents($out . '-sentinel') === 'existing rules', 'Existing files and symlink targets must never be overwritten.');
+            check(is_link($out . '/full-static.htaccess') === ($mapping === 'rules-symlink'), 'Publication must not replace an existing symlink.');
+            check(!file_exists($out . '/manifest.json') && array_diff(scandir($out), ['.', '..', 'full-static.htaccess', 'typo3temp']) === [], 'Failed publication must remove its complete manifest and temporary sibling.');
+        }
+
+        // The static rules and exporter must agree, including after redirects and below a mount.
+        foreach (['', '/site'] as $mount) {
+            $scoped = ['--base-url=' . $origin . $mount, '--resolve=fixture.test:' . $port . ':127.0.0.1'];
+            foreach (['vendor', 'typo3_src', 'config', 'var', 'src', 'tests', 'node_modules'] as $name) {
+                file_put_contents($list, $mount . '/news/' . $name . "/\n");
+                [$status, , $stderr] = command([...$scoped, '--urls=' . $list, '--output=' . $temp . '/nested-' . ++$serial]);
+                check($status === 0 && $stderr === '', 'Nested private-name page must remain exportable: ' . $stderr);
+            }
+            foreach (['/vendor/', '/typo3_src/', '/config/', '/var/', '/src/', '/tests/', '/node_modules/',
+                '/.hidden/', '/news/.hidden/', '/news/shell.php/', '/index.php', '/news/template.twig',
+                '/typo3temp/assets/tx_fixture/page/', '/denied-redirect'] as $path) {
+                file_put_contents($list, $mount . $path . "\n");
+                $out = $temp . '/denied-' . ++$serial;
+                [$status, $stdout, $stderr] = command([...$scoped, '--urls=' . $list, '--output=' . $out]);
+                check($status === 1 && str_contains($stderr, 'Static delivery denies'), 'Undeliverable page must fail export: ' . $path . ' ' . $stderr);
+                check(!file_exists($out . '/full-static.htaccess') && !str_contains($stdout, 'Ready for review:'), 'Denied pages must never produce ready rules.');
+            }
+        }
 
         file_put_contents($list, "/site/slow\n");
         [$status, $stdout, $stderr] = command(['--base-url=' . $origin . '/site', '--urls=' . $list,

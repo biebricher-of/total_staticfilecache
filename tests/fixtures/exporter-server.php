@@ -81,6 +81,10 @@ if (preg_match('~^/site/many-redirects/(\d+)$~', $path, $match)) {
     return;
 }
 switch ($path) {
+    case '/denied-redirect':
+    case '/site/denied-redirect':
+        header('Location: ' . (str_starts_with($path, '/site/') ? '/site' : '') . '/src/', true, 302);
+        return;
     case '/site/slash':
         header('Location: slash/', true, 301);
         return;

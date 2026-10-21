@@ -103,5 +103,5 @@ php tests/exporter.php
 python3 tests/apache.py
 ```
 
-Verified locally on PHP 8.2, 8.3 and 8.4: 291 exporter checks and 270 profile/path checks on each runtime. All 15 real version entry scripts were also exercised against an HTTP fixture. Apache 2.4.69 passed 960 requests across all profiles at both root and subdirectory mounts. The documented Apache minimum is based on required directive availability, not a live test of obsolete Apache builds.
+Verified locally on PHP 8.2, 8.3 and 8.4: 375 exporter checks and 270 profile/path checks on each runtime. All 15 real version entry scripts were also exercised against an HTTP fixture. Apache 2.4.69 passed 3480 requests across all profiles at root, subdirectory, encoded-space and Unicode mounts. The documented Apache minimum is based on required directive availability, not a live test of obsolete Apache builds.
 Compatibility is based on tagged upstream source, not a claim that obsolete TYPO3 releases are safe to expose publicly.

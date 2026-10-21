@@ -247,16 +247,24 @@ HELP;
             'pages' => array_values($this->completed),
             'failures' => $failures,
         ];
+        if ($failures === []) {
+            // Older layouts can retain .xml/.rss/.sfc filenames even for HTML responses.
+            $this->writeFile($this->cacheDirectory . '/.htaccess', "ForceType text/html\nAddDefaultCharset Off\nOptions -Indexes -MultiViews -ExecCGI\n");
+            $rulesProfile = $this->profile;
+            $rulesProfile['pages'] = array_keys($this->completed);
+            $rules = apacheRules($rulesProfile, $this->origin, $this->cacheDirectory, $this->mount);
+        }
         $this->writeFile('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . "\n");
         if ($failures !== []) {
             throw new RuntimeException(count($failures) . ' page(s) failed; no full-static.htaccess generated.');
         }
-        // Older layouts can retain .xml/.rss/.sfc filenames even for HTML responses.
-        $this->writeFile($this->cacheDirectory . '/.htaccess', "ForceType text/html\nAddDefaultCharset Off\nOptions -Indexes -MultiViews -ExecCGI\n");
-        $rulesProfile = $this->profile;
-        $rulesProfile['pages'] = array_keys($this->completed);
-        $rules = apacheRules($rulesProfile, $this->origin, $this->cacheDirectory, $this->mount);
-        $this->writeFile('full-static.htaccess', $rules);
+        try {
+            $this->writeFile('full-static.htaccess', $rules);
+        } catch (Throwable $error) {
+            // This manifest is ours; a failed final publication is not a complete release.
+            unlink($this->output . '/manifest.json');
+            throw $error;
+        }
         fwrite(STDOUT, 'Exported ' . count($this->completed) . " HTML page(s) to {$this->output}\n");
         fwrite(STDOUT, "Ready for review: {$this->output}/full-static.htaccess (do not deploy manifest.json).\n");
     }
@@ -334,6 +342,12 @@ HELP;
                 $path = strtolower(rawurldecode((string) parse_url($url, PHP_URL_PATH)));
                 if (preg_match('~/(?:login|log-in|signin|sign-in|typo3)(?:/|$)~', $path)) {
                     throw new RuntimeException("Authentication path cannot be exported: $url");
+                }
+                $relative = ltrim(rawurldecode(substr((string) parse_url($url, PHP_URL_PATH), strlen($this->mount))), '/');
+                foreach (apacheDeniedPaths($this->cacheDirectory) as $pattern) {
+                    if (preg_match('~' . $pattern . '~i', $relative)) {
+                        throw new RuntimeException("Static delivery denies page path: $url");
+                    }
                 }
             }
             $body = '';
@@ -628,21 +642,37 @@ HELP;
         if (is_link($path)) {
             throw new RuntimeException("Symlink file refused: $path");
         }
-        $stream = @fopen($path, 'xb');
+        $temporary = $path . '.tmp-' . bin2hex(random_bytes(12));
+        $stream = @fopen($temporary, 'xb');
         if ($stream === false) {
-            throw new RuntimeException("Cannot exclusively create file: $path");
+            throw new RuntimeException("Cannot exclusively create file: $temporary");
         }
         try {
             $offset = 0;
             while ($offset < strlen($contents)) {
-                $written = fwrite($stream, substr($contents, $offset));
+                $written = @fwrite($stream, substr($contents, $offset));
                 if ($written === false || $written === 0) {
                     throw new RuntimeException("Cannot write file: $path");
                 }
                 $offset += $written;
             }
+            if (!fflush($stream)) {
+                throw new RuntimeException("Cannot flush file: $path");
+            }
+            $closed = fclose($stream);
+            $stream = null;
+            if (!$closed) {
+                throw new RuntimeException("Cannot close file: $path");
+            }
+            // Unlike rename(), link() atomically publishes without replacing a file or symlink.
+            if (!@link($temporary, $path)) {
+                throw new RuntimeException("Cannot exclusively publish file: $path");
+            }
         } finally {
-            fclose($stream);
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+            unlink($temporary);
         }
     }
 }

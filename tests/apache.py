@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import tempfile
 import time
+import urllib.parse
 
 PROJECT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -31,8 +32,13 @@ def request(port, path, method='GET', host='example.test'):
 profiles = json.loads(php('require "src/Profiles.php"; echo json_encode(array_keys(TotalStaticFileCache\\profiles()));'))
 checks = 0
 for version in profiles:
-    for mount in ['', '/site']:
-        urls = ['http://example.test' + mount + path for path in ['/', '/news/', '/caf%C3%A9/', '/space%20here/', '/a&b/', '/html-as-feed.xml']]
+    for mount in ['', '/site', '/space%20site', '/caf%C3%A9']:
+        page_paths = ['/', '/news/', '/caf%C3%A9/', '/space%20here/', '/a&b/', '/html-as-feed.xml',
+                      '/news/src/', '/news/vendor/', '/news/typo3_src/', '/news/config/',
+                      '/news/var/', '/news/tests/', '/news/node_modules/']
+        denied_pages = ['/vendor/', '/typo3_src/', '/config/', '/var/', '/src/', '/tests/', '/node_modules/',
+                        '/news/shell.php/']
+        urls = ['http://example.test' + mount + path for path in page_paths + denied_pages]
         generated = json.loads(php(
             'require "src/Profiles.php"; require "src/Apache.php"; '
             '$p=TotalStaticFileCache\\profile($argv[1]); $p["pages"]=json_decode($argv[2],true); '
@@ -43,7 +49,7 @@ for version in profiles:
             root = pathlib.Path(temp)
             root.chmod(0o755)
             doc = root / 'www'
-            site = doc / mount.lstrip('/') if mount else doc
+            site = doc / urllib.parse.unquote(mount).lstrip('/') if mount else doc
             site.mkdir(parents=True)
             (site / '.htaccess').write_text(generated['rules'])
             for url, relative in generated['files'].items():
@@ -58,6 +64,17 @@ for version in profiles:
                 'fileadmin/shell.php.jpg': '<?php echo "PHP EXECUTED";',
                 'typo3conf/LocalConfiguration.php': 'SECRET',
                 'typo3conf/ext/demo/Resources/Public/site.css': 'body{}',
+                'typo3conf/ext/demo/Resources/Public/vendor/library.js': 'console.log(6)',
+                'typo3conf/ext/demo/Resources/Public/src/library.js': 'console.log(7)',
+                'vendor/private.js': 'SECRET',
+                'src/private.js': 'SECRET',
+                'config/private.json': 'SECRET',
+                'var/private.txt': 'SECRET',
+                'tests/private.txt': 'SECRET',
+                'node_modules/private.js': 'SECRET',
+                'typo3_src/private.js': 'SECRET',
+                'fileadmin/.hidden/image.svg': 'SECRET',
+                'typo3conf/ext/demo/Resources/Public/vendor/shell.php.js': 'SECRET',
                 'typo3conf/ext/demo/res/legacy.css': 'body{}',
                 'typo3temp/compressor/merged-abc.js': 'console.log(3)',
                 'typo3temp/javascript_abcdef1234.js': 'console.log(4)',
@@ -98,7 +115,9 @@ for version in profiles:
                         break
                     except (ConnectionError, OSError):
                         time.sleep(0.1)
-                cases = [(mount + path, 'GET', 200, None) for path in ['/', '/news/', '/caf%C3%A9/', '/space%20here/', '/a&b/', '/html-as-feed.xml']]
+                cases = [(mount + path, 'GET', 200, None) for path in page_paths]
+                # Even an exact snapshot mapping must not bypass the private/script guards.
+                cases += [(mount + path, 'GET', 404, None) for path in denied_pages]
                 cases += [(mount + path, 'GET', status, None) for path, status in [
                     ('/missing/', 404), ('/index.php', 404), ('/shell.PHP', 404),
                     ('/index.php/news', 404), ('/typo3/', 404), ('/.env', 404),
@@ -111,6 +130,12 @@ for version in profiles:
                     ('/typo3temp/javascript_abcdef1234.js', 200), ('/typo3temp/stylesheet_abcdef1234.css', 200),
                     ('/typo3temp/pics/legacy.gif', 200), ('/typo3/sysext/cms/tslib/media/scripts/gmenu_layers.js', 200),
                     ('/typo3/sysext/demo/Resources/Public/core.js', 200),
+                    ('/typo3conf/ext/demo/Resources/Public/vendor/library.js', 200),
+                    ('/typo3conf/ext/demo/Resources/Public/src/library.js', 200),
+                    ('/vendor/private.js', 404), ('/src/private.js', 404), ('/config/private.json', 404),
+                    ('/var/private.txt', 404), ('/tests/private.txt', 404), ('/node_modules/private.js', 404),
+                    ('/typo3_src/private.js', 404), ('/fileadmin/.hidden/image.svg', 404),
+                    ('/typo3conf/ext/demo/Resources/Public/vendor/shell.php.js', 404),
                 ]]
                 cases += [(mount + '/news/', 'HEAD', 200, None), (mount + '/news/', 'POST', 405, None),
                           (mount + '/news/', 'GET', 404, 'wrong.test')]
@@ -119,10 +144,11 @@ for version in profiles:
                     assert status == expected, (version, mount, path, method, status, expected, body,
                                                 docker('logs', container))
                     assert b'PHP EXECUTED' not in body and b'SECRET' not in body, (path, body)
-                    if expected == 200 and path in [mount + '/', mount + '/news/', mount + '/news/?', mount + '/html-as-feed.xml']:
+                    if expected == 200 and path in [mount + page for page in page_paths] + [mount + '/news/?']:
                         assert content_type.startswith('text/html'), (path, content_type)
                         if method == 'GET':
-                            assert b'dynamic plugin snapshot' in body, (path, body)
+                            expected_body = '<html>dynamic plugin snapshot http://example.test' + path.removesuffix('?') + '</html>'
+                            assert body == expected_body.encode(), (path, body)
                     checks += 1
                 print(f'PASS Apache {version} mount={mount or "/"}')
             finally:

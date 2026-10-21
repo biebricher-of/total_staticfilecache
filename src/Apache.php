@@ -20,7 +20,6 @@ function apacheRules(array $profile, string $origin, string $cacheDirectory, str
         throw new \InvalidArgumentException('Apache generation requires the successfully exported page URLs in profile[pages].');
     }
     $mount = rtrim($mountPath, '/');
-    $cachePattern = preg_quote(trim($cacheDirectory, '/'), '~');
     $authority = strtolower($parts['host']);
     $port = $parts['port'] ?? ($parts['scheme'] === 'https' ? 443 : 80);
     $defaultPort = $parts['scheme'] === 'https' ? 443 : 80;
@@ -54,9 +53,7 @@ function apacheRules(array $profile, string $origin, string $cacheDirectory, str
         'RewriteRule ^ - [R=405,END]',
         '',
         '# Deny scripts, hidden files, configuration and direct snapshot access.',
-        'RewriteRule "(^|/)(?:\\.|(?:index\\.php|vendor|typo3_src|config|var|src|tests|node_modules)(?:/|$))" - [R=404,END,NC]',
-        'RewriteRule "\\.(?:php[0-9]*|phtml|pht|phar|phps|cgi|fcgi|pl|py|rb|sh|shtml|htaccess|ini|sql|ya?ml|twig|bak|log)(?:[./;]|$)" - [R=404,END,NC]',
-        'RewriteRule "^' . $cachePattern . '(?:/|$)" - [R=404,END,NC]',
+        ...array_map(static fn (string $pattern): string => 'RewriteRule "' . $pattern . '" - [R=404,END,NC]', apacheDeniedPaths($cacheDirectory)),
         '',
         '# Exact exported URL -> version-specific cache file; no runtime PHP lookup.',
         '# Query strings on HTML requests are rejected rather than silently sharing a snapshot.',
@@ -67,9 +64,9 @@ function apacheRules(array $profile, string $origin, string $cacheDirectory, str
         if ($mount !== '' && $path !== $mount && !str_starts_with($path, $mount . '/')) {
             throw new \InvalidArgumentException('Exported page is outside the installation mount.');
         }
-        $target = $mount . '/' . trim($cacheDirectory, '/') . '/' . cacheFile($profile, $url);
-        // Rewrite substitutions are URLs: encode the on-disk percent signs once more.
-        $target = implode('/', array_map('rawurlencode', explode('/', $target)));
+        // Encode on-disk cache names, not the already URL-encoded installation mount.
+        $suffix = '/' . trim($cacheDirectory, '/') . '/' . cacheFile($profile, $url);
+        $target = $mount . implode('/', array_map('rawurlencode', explode('/', $suffix)));
         // A literal percent must not be interpreted as a RewriteCond %N backreference.
         $target = str_replace('%', '\\%', $target);
         $lines[] = 'RewriteCond %{QUERY_STRING} ^$';
@@ -92,6 +89,17 @@ function apacheRules(array $profile, string $origin, string $cacheDirectory, str
         ''
     );
     return implode("\n", $lines);
+}
+
+/** Shared by the exporter and per-directory Apache rules, after URL decoding and mount removal. */
+function apacheDeniedPaths(string $cacheDirectory): array
+{
+    return [
+        '(^|/)\\.',
+        '^(?:vendor|typo3_src|config|var|src|tests|node_modules)(?:/|$)',
+        '\\.(?:php[0-9]*|phtml|pht|phar|phps|cgi|fcgi|pl|py|rb|sh|shtml|htaccess|ini|sql|ya?ml|twig|bak|log)(?:[./;]|$)',
+        '^' . preg_quote(trim($cacheDirectory, '/'), '~') . '(?:/|$)',
+    ];
 }
 
 /** Escape Apache config syntax as well as regular-expression metacharacters. */
