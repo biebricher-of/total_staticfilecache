@@ -31,7 +31,9 @@ php staticfilecache-v16.php \
 
 Repeat `--sitemap` for the domains/languages of **one TYPO3 instance sharing one public cache directory**. Sitemap indexes are expanded recursively. Include every sitemap you intend to publish: the tool does not follow HTML links.
 
-Without `--base-url`, the first sitemap defines the primary origin and the installation prefix defaults to `/`. The sitemap's directory is **not** inferred as an installation prefix. For a subdirectory installation, add `--base-url=https://www.example.org/site`, even when exporting only from sitemaps. With that explicit base, relative sitemap arguments are also accepted.
+**Multiple domains at the site root:** For domains such as `https://www.example.de/` and `https://www.example.com/`, supply both sitemaps as shown above and omit `--base-url`. Both domains serve their own exported pages; the first sitemap does not restrict delivery to its domain.
+
+**Subdirectory installations only:** If the TYPO3 instance is installed beneath a shared path such as `/site/` on both domains, add `--base-url=https://www.example.de/site`, even when exporting only from sitemaps. This sets the shared installation prefix to `/site`; otherwise it defaults to `/`. The sitemap's directory is **not** used to infer that prefix. With an explicit base, relative sitemap arguments are also accepted.
 
 ### 2. Export from URL-list files
 
